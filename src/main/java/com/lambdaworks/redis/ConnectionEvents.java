@@ -1,0 +1,66 @@
+package com.lambdaworks.redis;
+
+import java.util.Set;
+
+import com.google.common.util.concurrent.SettableFuture;
+import com.lambdaworks.redis.internal.LettuceSets;
+
+/**
+ * Close Events Facility. Can register/unregister CloseListener and fire a closed event to all registered listeners.
+ * 
+ * @author Mark Paluch
+ * @since 3.0
+ */
+public class ConnectionEvents {
+    private final Set<RedisConnectionStateListener> listeners = LettuceSets.newConcurrentLinkedHashSet();
+
+    protected void fireEventRedisConnected(RedisChannelHandler<?, ?> connection) {
+        for (RedisConnectionStateListener listener : listeners) {
+            listener.onRedisConnected(connection);
+        }
+    }
+
+    protected void fireEventRedisDisconnected(RedisChannelHandler<?, ?> connection) {
+        for (RedisConnectionStateListener listener : listeners) {
+            listener.onRedisDisconnected(connection);
+        }
+    }
+
+    protected void fireEventRedisExceptionCaught(RedisChannelHandler<?, ?> connection, Throwable cause) {
+        for (RedisConnectionStateListener listener : listeners) {
+            listener.onRedisExceptionCaught(connection, cause);
+        }
+    }
+
+    public void addListener(RedisConnectionStateListener listener) {
+        listeners.add(listener);
+    }
+
+    public void removeListener(RedisConnectionStateListener listener) {
+        listeners.remove(listener);
+    }
+
+    /**
+     * Internal event before a channel is closed.
+     */
+    public static class PrepareClose {
+        private SettableFuture<Boolean> prepareCloseFuture = SettableFuture.create();
+
+        public SettableFuture<Boolean> getPrepareCloseFuture() {
+            return prepareCloseFuture;
+        }
+    }
+
+    /**
+     * Internal event when a channel is closed.
+     */
+    public static class Close {
+    }
+
+    /**
+     * Internal event when a channel is activated.
+     */
+    public static class Activated {
+    }
+
+}
