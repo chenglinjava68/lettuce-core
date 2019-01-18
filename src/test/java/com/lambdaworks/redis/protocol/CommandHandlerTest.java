@@ -1,0 +1,880 @@
+/*
+ * Copyright 2011-2019 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.lambdaworks.redis.protocol;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Fail.fail;
+import static org.mockito.AdditionalMatchers.gt;
+import static org.mockito.Matchers.any;
+import static org.mockito.Mockito.*;
+
+import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.InetSocketAddress;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LoggerContext;
+import org.apache.logging.log4j.core.config.Configuration;
+import org.apache.logging.log4j.core.config.LoggerConfig;
+import org.junit.AfterClass;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.junit.MockitoJUnitRunner;
+import org.mockito.stubbing.Answer;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import com.lambdaworks.redis.ClientOptions;
+import com.lambdaworks.redis.ConnectionEvents;
+import com.lambdaworks.redis.RedisChannelHandler;
+import com.lambdaworks.redis.RedisException;
+import com.lambdaworks.redis.codec.StringCodec;
+import com.lambdaworks.redis.codec.Utf8StringCodec;
+import com.lambdaworks.redis.metrics.CommandLatencyCollector;
+import com.lambdaworks.redis.output.StatusOutput;
+import com.lambdaworks.redis.resource.ClientResources;
+
+import edu.umd.cs.mtc.MultithreadedTestCase;
+import edu.umd.cs.mtc.TestFramework;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.*;
+import io.netty.handler.codec.EncoderException;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
+import io.netty.util.concurrent.ImmediateEventExecutor;
+
+@RunWith(MockitoJUnitRunner.class)
+public class CommandHandlerTest {
+
+    private Queue<RedisCommand<String, String, ?>> disconnectedBuffer;
+    private Queue<RedisCommand<String, String, ?>> stack;
+
+    private CommandHandler<String, String> sut;
+
+    private final Command<String, String, String> command = new Command<>(CommandType.APPEND, new StatusOutput<>(
+            new Utf8StringCodec()), null);
+
+    @Mock
+    private ChannelHandlerContext context;
+
+    @Mock
+    private Channel channel;
+
+    @Mock
+    private ChannelPipeline pipeline;
+
+    @Mock
+    private EventLoop eventLoop;
+
+    @Mock
+    private ClientResources clientResources;
+
+    @Mock
+    private RedisChannelHandler channelHandler;
+
+    @Mock
+    private ChannelPromise promise;
+
+    @Mock
+    private CommandLatencyCollector latencyCollector;
+
+    @BeforeClass
+    public static void beforeClass() {
+        LoggerContext ctx = (LoggerContext) LogManager.getContext();
+        Configuration config = ctx.getConfiguration();
+        LoggerConfig loggerConfig = config.getLoggerConfig(CommandHandler.class.getName());
+        loggerConfig.setLevel(Level.ALL);
+    }
+
+    @AfterClass
+    public static void afterClass() {
+        LoggerContext ctx = (LoggerContext) LogManager.getContext();
+        Configuration config = ctx.getConfiguration();
+        LoggerConfig loggerConfig = config.getLoggerConfig(CommandHandler.class.getName());
+        loggerConfig.setLevel(null);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Before
+    public void before() throws Exception {
+
+        when(context.channel()).thenReturn(channel);
+        when(channel.pipeline()).thenReturn(pipeline);
+        when(channel.eventLoop()).thenReturn(eventLoop);
+        when(channel.remoteAddress()).thenReturn(new InetSocketAddress(Inet4Address.getLocalHost(), 1234));
+        when(channel.localAddress()).thenReturn(new InetSocketAddress(Inet4Address.getLocalHost(), 1234));
+        when(eventLoop.submit(any(Runnable.class))).thenAnswer(invocation -> {
+            Runnable r = (Runnable) invocation.getArguments()[0];
+            r.run();
+            return null;
+        });
+
+        when(latencyCollector.isEnabled()).thenReturn(true);
+        when(clientResources.commandLatencyCollector()).thenReturn(latencyCollector);
+
+        when(channel.writeAndFlush(any())).thenAnswer(invocation -> {
+
+            if (invocation.getArguments()[0] instanceof RedisCommand) {
+                stack.add((RedisCommand) invocation.getArguments()[0]);
+            }
+
+            if (invocation.getArguments()[0] instanceof Collection) {
+                stack.addAll((Collection) invocation.getArguments()[0]);
+            }
+
+            return promise;
+        });
+
+        sut = new CommandHandler<>(ClientOptions.create(), clientResources);
+        sut.setRedisChannelHandler(channelHandler);
+        disconnectedBuffer = (Queue) ReflectionTestUtils.getField(sut, "disconnectedBuffer");
+        stack = (Queue) ReflectionTestUtils.getField(sut, "stack");
+
+        when(promise.addListener(any())).then(invocation -> {
+
+            GenericFutureListener<Future<Void>> listener = invocation.getArgument(0);
+            listener.operationComplete(promise);
+
+            return null;
+        });
+    }
+
+    @Test
+    public void testChannelActive() throws Exception {
+        sut.channelRegistered(context);
+
+        sut.channelActive(context);
+
+        verify(pipeline).fireUserEventTriggered(any(ConnectionEvents.Activated.class));
+    }
+
+    @Test
+    public void testChannelActiveFailureShouldCancelCommands() throws Exception {
+
+        ClientOptions clientOptions = ClientOptions.builder().cancelCommandsOnReconnectFailure(true).build();
+
+        sut = new CommandHandler<>(clientOptions, clientResources);
+        sut.setRedisChannelHandler(channelHandler);
+
+        sut.channelRegistered(context);
+        sut.write(command);
+
+        reset(context);
+        when(context.channel()).thenThrow(new RuntimeException());
+        try {
+            sut.channelActive(context);
+            fail("Missing RuntimeException");
+        } catch (RuntimeException e) {
+        }
+
+        assertThat(command.isCancelled()).isTrue();
+    }
+
+    @Test
+    public void testChannelActiveWithBufferedAndQueuedCommands() throws Exception {
+
+        when(promise.isSuccess()).thenReturn(true);
+
+        Command<String, String, String> bufferedCommand = new Command<>(CommandType.GET, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        Command<String, String, String> pingCommand = new Command<>(CommandType.PING,
+                new StatusOutput<>(new Utf8StringCodec()), null);
+        disconnectedBuffer.add(bufferedCommand);
+
+        AtomicLong atomicLong = (AtomicLong) ReflectionTestUtils.getField(sut, "writers");
+        doAnswer(new Answer() {
+            @Override
+            public Object answer(InvocationOnMock invocation) throws Throwable {
+
+                assertThat(atomicLong.get()).isEqualTo(-1);
+                assertThat(ReflectionTestUtils.getField(sut, "exclusiveLockOwner")).isNotNull();
+
+                sut.write(pingCommand);
+
+                return null;
+            }
+        }).when(channelHandler).activated();
+
+        sut.channelRegistered(context);
+        sut.channelActive(context);
+
+        assertThat(atomicLong.get()).isEqualTo(0);
+        assertThat(ReflectionTestUtils.getField(sut, "exclusiveLockOwner")).isNull();
+        assertThat(stack).containsSequence(pingCommand, bufferedCommand);
+
+        verify(pipeline).fireUserEventTriggered(any(ConnectionEvents.Activated.class));
+    }
+
+    @Test
+    public void testChannelActiveWithBufferedAndQueuedCommandsRetainsOrder() throws Exception {
+
+        Command<String, String, String> bufferedCommand1 = new Command<>(CommandType.SET, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        Command<String, String, String> bufferedCommand2 = new Command<>(CommandType.GET, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        Command<String, String, String> queuedCommand1 = new Command<>(CommandType.PING, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        Command<String, String, String> queuedCommand2 = new Command<>(CommandType.AUTH, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        disconnectedBuffer.add(queuedCommand1);
+        disconnectedBuffer.add(queuedCommand2);
+
+        disconnectedBuffer.add(bufferedCommand1);
+        disconnectedBuffer.add(bufferedCommand2);
+
+        reset(channel);
+        when(channel.writeAndFlush(any())).thenAnswer(invocation -> new DefaultChannelPromise(channel));
+        when(channel.eventLoop()).thenReturn(eventLoop);
+        when(channel.pipeline()).thenReturn(pipeline);
+
+        sut.channelRegistered(context);
+        sut.channelActive(context);
+
+        ArgumentCaptor<Object> objectArgumentCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(channel).writeAndFlush(objectArgumentCaptor.capture());
+
+        assertThat((Collection) objectArgumentCaptor.getValue()).containsSequence(queuedCommand1, queuedCommand2,
+                bufferedCommand1, bufferedCommand2);
+    }
+
+    @Test
+    public void testChannelActiveReplayBufferedCommands() throws Exception {
+
+        Command<String, String, String> bufferedCommand1 = new Command<>(CommandType.SET, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        Command<String, String, String> bufferedCommand2 = new Command<>(CommandType.GET, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        Command<String, String, String> queuedCommand1 = new Command<>(CommandType.PING, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        Command<String, String, String> queuedCommand2 = new Command<>(CommandType.AUTH, new StatusOutput<>(
+                new Utf8StringCodec()), null);
+
+        disconnectedBuffer.add(queuedCommand1);
+        disconnectedBuffer.add(queuedCommand2);
+
+        disconnectedBuffer.add(bufferedCommand1);
+        disconnectedBuffer.add(bufferedCommand2);
+
+        when(promise.isSuccess()).thenReturn(true);
+
+        sut.channelRegistered(context);
+        sut.channelActive(context);
+
+        assertThat(stack).containsSequence(queuedCommand1, queuedCommand2, bufferedCommand1, bufferedCommand2);
+        assertThat(disconnectedBuffer).isEmpty();
+    }
+
+    @Test
+    public void testExceptionChannelActive() throws Exception {
+        sut.setState(CommandHandler.LifecycleState.ACTIVE);
+
+        when(channel.isActive()).thenReturn(true);
+
+        sut.channelActive(context);
+        sut.exceptionCaught(context, new Exception());
+    }
+
+    @Test
+    public void testIOExceptionChannelActive() throws Exception {
+        sut.setState(CommandHandler.LifecycleState.ACTIVE);
+
+        when(channel.isActive()).thenReturn(true);
+
+        sut.channelActive(context);
+        sut.exceptionCaught(context, new IOException("Connection timed out"));
+    }
+
+    @Test
+    public void testWriteChannelDisconnected() throws Exception {
+
+        sut.channelRegistered(context);
+        sut.channelActive(context);
+
+        sut.setState(CommandHandler.LifecycleState.DISCONNECTED);
+
+        sut.write(command);
+
+        assertThat(disconnectedBuffer).hasSize(1);
+        assertThat(CommandWrapper.unwrap(disconnectedBuffer.element())).isEqualTo(command);
+    }
+
+    @Test(expected = RedisException.class)
+    public void testWriteChannelDisconnectedWithoutReconnect() throws Exception {
+
+        sut = new CommandHandler<>(ClientOptions.builder().autoReconnect(false).build(), clientResources);
+        sut.setRedisChannelHandler(channelHandler);
+
+        sut.channelRegistered(context);
+        sut.channelActive(context);
+
+        sut.setState(CommandHandler.LifecycleState.DISCONNECTED);
+
+        sut.write(command);
+    }
+
+    @Test
+    public void testExceptionChannelInactive() throws Exception {
+        sut.setState(CommandHandler.LifecycleState.DISCONNECTED);
+        sut.exceptionCaught(context, new Exception());
+        verify(context, never()).fireExceptionCaught(any(Exception.class));
+    }
+
+    @Test
+    public void testExceptionWithQueue() throws Exception {
+        sut.setState(CommandHandler.LifecycleState.ACTIVE);
+        disconnectedBuffer.clear();
+
+        sut.channelActive(context);
+        when(channel.isActive()).thenReturn(true);
+
+        stack.add(command);
+        sut.exceptionCaught(context, new Exception());
+
+        assertThat(stack).isEmpty();
+        command.get();
+
+        assertThat(ReflectionTestUtils.getField(command, "exception")).isNotNull();
+    }
+
+    @Test(expected = RedisException.class)
+    public void testWriteWhenClosed() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.CLOSED);
+
+        sut.write(command);
+    }
+
+    @Test
+    public void testExceptionWhenClosed() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.CLOSED);
+
+        sut.exceptionCaught(context, new Exception());
+        verifyZeroInteractions(context);
+    }
+
+    @Test
+    public void isConnectedShouldReportFalseForNOT_CONNECTED() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.NOT_CONNECTED);
+        assertThat(sut.isConnected()).isFalse();
+    }
+
+    @Test
+    public void isConnectedShouldReportFalseForREGISTERED() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.REGISTERED);
+        assertThat(sut.isConnected()).isFalse();
+    }
+
+    @Test
+    public void isConnectedShouldReportTrueForCONNECTED() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.CONNECTED);
+        assertThat(sut.isConnected()).isTrue();
+    }
+
+    @Test
+    public void isConnectedShouldReportTrueForACTIVATING() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.ACTIVATING);
+        assertThat(sut.isConnected()).isTrue();
+    }
+
+    @Test
+    public void isConnectedShouldReportTrueForACTIVE() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.ACTIVE);
+        assertThat(sut.isConnected()).isTrue();
+    }
+
+    @Test
+    public void isConnectedShouldReportFalseForDISCONNECTED() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.DISCONNECTED);
+        assertThat(sut.isConnected()).isFalse();
+    }
+
+    @Test
+    public void isConnectedShouldReportFalseForDEACTIVATING() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.DEACTIVATING);
+        assertThat(sut.isConnected()).isFalse();
+    }
+
+    @Test
+    public void isConnectedShouldReportFalseForDEACTIVATED() throws Exception {
+
+        sut.setState(CommandHandler.LifecycleState.DEACTIVATED);
+        assertThat(sut.isConnected()).isFalse();
+    }
+
+    @Test
+    public void isConnectedShouldReportFalseForCLOSED() {
+
+        sut.setState(CommandHandler.LifecycleState.CLOSED);
+        assertThat(sut.isConnected()).isFalse();
+    }
+
+    @Test
+    public void shouldCancelCommandsOnEncoderException() throws Exception {
+
+        sut.channelActive(context);
+        when(promise.cause()).thenReturn(new EncoderException("foo"));
+
+        sut.write(command);
+
+        assertThat(command.exception).isInstanceOf(EncoderException.class);
+    }
+
+    @Test
+    public void shouldNotWriteCancelledCommand() throws Exception {
+
+        command.cancel();
+        sut.write(context, command, promise);
+
+        verifyZeroInteractions(context);
+        assertThat(disconnectedBuffer).isEmpty();
+        verify(promise).trySuccess();
+
+    }
+
+    @Test
+    public void shouldNotWriteCancelledCommands() throws Exception {
+
+        command.cancel();
+        sut.write(context, Collections.singleton(command), promise);
+
+        verifyZeroInteractions(context);
+        assertThat(disconnectedBuffer).isEmpty();
+        verify(promise).trySuccess();
+    }
+
+    @Test
+    public void shouldCancelCommandOnQueueSingleFailure() throws Exception {
+
+        Command<String, String, String> commandMock = mock(Command.class);
+
+        RuntimeException exception = new RuntimeException();
+        when(commandMock.getOutput()).thenThrow(exception);
+
+        ChannelPromise channelPromise = new DefaultChannelPromise(channel, ImmediateEventExecutor.INSTANCE);
+        try {
+            sut.write(context, commandMock, channelPromise);
+            fail("Missing RuntimeException");
+        } catch (RuntimeException e) {
+            assertThat(e).isSameAs(exception);
+        }
+
+        assertThat(disconnectedBuffer).isEmpty();
+        verify(commandMock).completeExceptionally(exception);
+    }
+
+    @Test
+    public void shouldCancelCommandOnQueueBatchFailure() throws Exception {
+
+        Command<String, String, String> commandMock = mock(Command.class);
+
+        RuntimeException exception = new RuntimeException();
+        when(commandMock.getOutput()).thenThrow(exception);
+
+        ChannelPromise channelPromise = new DefaultChannelPromise(channel, ImmediateEventExecutor.INSTANCE);
+        try {
+            sut.write(context, Arrays.asList(commandMock), channelPromise);
+            fail("Missing RuntimeException");
+        } catch (RuntimeException e) {
+            assertThat(e).isSameAs(exception);
+        }
+
+        assertThat(disconnectedBuffer).isEmpty();
+        verify(commandMock).completeExceptionally(exception);
+    }
+
+    @Test
+    public void shouldFailOnDuplicateCommands() throws Exception {
+
+        Command<String, String, String> commandMock = mock(Command.class);
+
+        ChannelPromise channelPromise = new DefaultChannelPromise(channel, ImmediateEventExecutor.INSTANCE);
+        sut.write(context, Arrays.asList(commandMock, commandMock), channelPromise);
+
+        assertThat(stack).isEmpty();
+        verify(commandMock).completeExceptionally(any(RedisException.class));
+    }
+
+    @Test
+    public void shouldWriteActiveCommands() throws Exception {
+
+        when(promise.isSuccess()).thenReturn(true);
+
+        sut.write(context, command, promise);
+
+        verify(context).write(command, promise);
+        assertThat(stack).hasSize(1).allMatch(o -> o instanceof LatencyMeteredCommand);
+    }
+
+    @Test
+    public void shouldNotWriteCancelledCommandBatch() throws Exception {
+
+        command.cancel();
+        sut.write(context, Arrays.asList(command), promise);
+
+        verifyZeroInteractions(context);
+        assertThat(disconnectedBuffer).isEmpty();
+    }
+
+    @Test
+    public void shouldWriteSingleActiveCommandsInBatch() throws Exception {
+
+        when(promise.isSuccess()).thenReturn(true);
+
+        List<Command<String, String, String>> commands = Arrays.asList(command);
+        sut.write(context, commands, promise);
+
+        verify(context).write(command, promise);
+        assertThat(stack).hasSize(1);
+    }
+
+    @Test
+    public void shouldWriteActiveCommandsInBatch() throws Exception {
+
+        Command<String, String, String> anotherCommand = new Command<>(CommandType.APPEND,
+                new StatusOutput<>(StringCodec.UTF8), null);
+
+        List<Command<String, String, String>> commands = Arrays.asList(command, anotherCommand);
+        sut.write(context, commands, promise);
+
+        verify(context).write(any(Set.class), eq(promise));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void shouldWriteActiveCommandsInMixedBatch() throws Exception {
+
+        when(promise.isSuccess()).thenReturn(true);
+
+        Command<String, String, String> command2 = new Command<>(CommandType.APPEND, new StatusOutput<>(new Utf8StringCodec()),
+                null);
+        command.cancel();
+
+        sut.write(context, Arrays.asList(command, command2), promise);
+
+        ArgumentCaptor<Collection> captor = ArgumentCaptor.forClass(Collection.class);
+        verify(context).write(captor.capture(), any());
+
+        assertThat(captor.getValue()).containsOnly(command2);
+        assertThat(stack).hasSize(1).allMatch(o -> o instanceof LatencyMeteredCommand)
+                .allMatch(o -> CommandWrapper.unwrap((RedisCommand) o) == command2);
+    }
+
+    @Test
+    public void shouldRecordCorrectFirstResponseLatency() throws Exception {
+
+        when(promise.isSuccess()).thenReturn(true);
+        sut.channelActive(context);
+
+        LatencyMeteredCommand<String, String, String> wrapped = new LatencyMeteredCommand<>(command);
+
+        sut.write(context, wrapped, promise);
+        Thread.sleep(10);
+
+        sut.channelRead(context, Unpooled.wrappedBuffer("*1\r\n+OK\r\n".getBytes()));
+
+        verify(latencyCollector).recordCommandLatency(any(), any(), eq(CommandType.APPEND), gt(0L), gt(0L));
+    }
+
+    @Test
+    public void shouldIgnoreNonReadableBuffers() throws Exception {
+
+        ByteBuf byteBufMock = mock(ByteBuf.class);
+        when(byteBufMock.isReadable()).thenReturn(false);
+
+        sut.channelRead(context, byteBufMock);
+
+        verify(byteBufMock, never()).release();
+    }
+
+    @Test(timeout = 5000)
+    public void shouldRebuildHugeQueue() throws Exception {
+
+        when(promise.isSuccess()).thenReturn(true);
+
+        for (int i = 0; i < 500000; i++) {
+
+            Command<String, String, String> command = new Command<>(CommandType.SET, new StatusOutput<>(StringCodec.UTF8));
+            disconnectedBuffer.add(new AsyncCommand<>(command));
+        }
+
+        sut.channelInactive(context);
+        sut.channelActive(context);
+
+        assertThat(disconnectedBuffer).isEmpty();
+    }
+
+    @Test
+    public void retryListenerDoesNotRetryCompletedCommands() {
+
+        CommandHandler.RetryListener listener = sut.new RetryListener(command);
+
+        command.complete();
+        when(promise.cause()).thenReturn(new Exception());
+
+        listener.operationComplete(promise);
+
+        verify(channel, never()).writeAndFlush(command);
+    }
+
+    @Test
+    public void testMTCConcurrentWriteThenReset() throws Throwable {
+        TestFramework.runOnce(new MTCConcurrentWriteThenReset(clientResources, command));
+    }
+
+    @Test
+    public void testMTCConcurrentResetThenWrite() throws Throwable {
+        TestFramework.runOnce(new MTCConcurrentResetThenWrite(clientResources, command));
+    }
+
+    @Test
+    public void testMTCConcurrentConcurrentWrite() throws Throwable {
+        TestFramework.runOnce(new MTCConcurrentConcurrentWrite(clientResources, command));
+    }
+
+    /**
+     * Test of concurrent access to locks. write call wins over reset call.
+     */
+    static class MTCConcurrentWriteThenReset extends MultithreadedTestCase {
+
+        private final Command<String, String, String> command;
+        private TestableCommandHandler handler;
+        private List<Thread> expectedThreadOrder = Collections.synchronizedList(new ArrayList<>());
+        private List<Thread> entryThreadOrder = Collections.synchronizedList(new ArrayList<>());
+        private List<Thread> exitThreadOrder = Collections.synchronizedList(new ArrayList<>());
+
+        public MTCConcurrentWriteThenReset(ClientResources clientResources, Command<String, String, String> command) {
+            this.command = command;
+            handler = new TestableCommandHandler(ClientOptions.create(), clientResources) {
+
+                @Override
+                protected void incrementWriters() {
+
+                    waitForTick(2);
+                    super.incrementWriters();
+                    waitForTick(4);
+                }
+
+                @Override
+                protected void lockWritersExclusive() {
+
+                    waitForTick(4);
+                    super.lockWritersExclusive();
+                }
+
+                @Override
+                protected <C extends RedisCommand<String, String, T>, T> void writeToDisconnectedBuffer(C command) {
+
+                    entryThreadOrder.add(Thread.currentThread());
+                    super.writeToDisconnectedBuffer(command);
+                }
+
+                @Override
+                protected List<RedisCommand<String, String, ?>> prepareReset() {
+
+                    entryThreadOrder.add(Thread.currentThread());
+                    return super.prepareReset();
+                }
+
+                @Override
+                protected void unlockWritersExclusive() {
+
+                    exitThreadOrder.add(Thread.currentThread());
+                    super.unlockWritersExclusive();
+                }
+
+                @Override
+                protected void decrementWriters() {
+
+                    exitThreadOrder.add(Thread.currentThread());
+                    super.decrementWriters();
+                }
+            };
+        }
+
+        public void thread1() throws InterruptedException {
+
+            waitForTick(1);
+            expectedThreadOrder.add(Thread.currentThread());
+            handler.write(command);
+
+        }
+
+        public void thread2() throws InterruptedException {
+
+            waitForTick(3);
+            expectedThreadOrder.add(Thread.currentThread());
+            handler.reset();
+        }
+
+        @Override
+        public void finish() {
+
+            assertThat(entryThreadOrder).containsExactlyElementsOf(expectedThreadOrder);
+            assertThat(exitThreadOrder).containsExactlyElementsOf(expectedThreadOrder);
+        }
+    }
+
+    /**
+     * Test of concurrent access to locks. write call wins over flush call.
+     */
+    static class MTCConcurrentResetThenWrite extends MultithreadedTestCase {
+
+        private final Command<String, String, String> command;
+        private TestableCommandHandler handler;
+        private List<Thread> expectedThreadOrder = Collections.synchronizedList(new ArrayList<>());
+        private List<Thread> entryThreadOrder = Collections.synchronizedList(new ArrayList<>());
+        private List<Thread> exitThreadOrder = Collections.synchronizedList(new ArrayList<>());
+
+        public MTCConcurrentResetThenWrite(ClientResources clientResources, Command<String, String, String> command) {
+            this.command = command;
+            handler = new TestableCommandHandler(ClientOptions.create(), clientResources) {
+
+                @Override
+                protected void incrementWriters() {
+
+                    waitForTick(4);
+                    super.incrementWriters();
+                }
+
+                @Override
+                protected void lockWritersExclusive() {
+
+                    waitForTick(2);
+                    super.lockWritersExclusive();
+                    waitForTick(4);
+                }
+
+                @Override
+                protected <C extends RedisCommand<String, String, T>, T> void writeToDisconnectedBuffer(C command) {
+
+                    entryThreadOrder.add(Thread.currentThread());
+                    super.writeToDisconnectedBuffer(command);
+                }
+
+                @Override
+                protected List<RedisCommand<String, String, ?>> prepareReset() {
+
+                    entryThreadOrder.add(Thread.currentThread());
+                    return super.prepareReset();
+                }
+
+                @Override
+                protected void unlockWritersExclusive() {
+
+                    exitThreadOrder.add(Thread.currentThread());
+                    super.unlockWritersExclusive();
+                }
+
+                @Override
+                protected void decrementWriters() {
+
+                    exitThreadOrder.add(Thread.currentThread());
+                    super.decrementWriters();
+                }
+            };
+        }
+
+        public void thread1() throws InterruptedException {
+
+            waitForTick(1);
+            expectedThreadOrder.add(Thread.currentThread());
+            handler.reset();
+        }
+
+        public void thread2() throws InterruptedException {
+
+            waitForTick(3);
+            expectedThreadOrder.add(Thread.currentThread());
+            handler.write(command);
+        }
+
+        @Override
+        public void finish() {
+
+            assertThat(entryThreadOrder).containsExactlyElementsOf(expectedThreadOrder);
+            assertThat(exitThreadOrder).containsExactlyElementsOf(expectedThreadOrder);
+        }
+    }
+
+    /**
+     * Test of concurrent access to locks. Two concurrent writes.
+     */
+    static class MTCConcurrentConcurrentWrite extends MultithreadedTestCase {
+
+        private final Command<String, String, String> command;
+        private TestableCommandHandler handler;
+
+        public MTCConcurrentConcurrentWrite(ClientResources clientResources, Command<String, String, String> command) {
+            this.command = command;
+            handler = new TestableCommandHandler(ClientOptions.create(), clientResources) {
+
+                @Override
+                protected <C extends RedisCommand<String, String, T>, T> void writeToDisconnectedBuffer(C command) {
+
+                    waitForTick(2);
+                    assertThat(writers.get()).isEqualTo(2);
+                    waitForTick(3);
+                    super.writeToDisconnectedBuffer(command);
+                }
+
+            };
+        }
+
+        public void thread1() throws InterruptedException {
+
+            waitForTick(1);
+            handler.write(command);
+        }
+
+        public void thread2() throws InterruptedException {
+
+            waitForTick(1);
+            handler.write(command);
+        }
+
+    }
+
+    static class TestableCommandHandler extends CommandHandler<String, String> {
+        public TestableCommandHandler(ClientOptions clientOptions, ClientResources clientResources) {
+            super(clientOptions, clientResources);
+        }
+    }
+
+}
